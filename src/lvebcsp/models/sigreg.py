@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
+from torch.distributed.nn.functional import all_gather
 from torch import nn
 
 
@@ -34,16 +36,24 @@ class SIGReg(nn.Module):
         if proj.ndim < 2:
             raise ValueError(f"SIGReg expects at least 2 dimensions [..., D], got {tuple(proj.shape)}")
         samples = proj.reshape(-1, proj.size(-1)).to(torch.float32)
+        distributed = self.training and dist.is_initialized() and dist.get_world_size() > 1
+        if distributed:
+            # Training loaders supply equal batches; keep cross-rank gradients.
+            samples = torch.cat(all_gather(samples), dim=0)
         generator = None
         if self.seed is not None:
             generator = torch.Generator(device=samples.device)
             generator.manual_seed(int(self.seed))
         # Build Gaussian basis from hypersphere directions.
         basis = torch.randn(samples.size(-1), self.num_proj, device=samples.device, generator=generator)
+        if distributed:
+            # Every rank evaluates the same global-batch statistic.
+            dist.broadcast(basis, src=0)
         basis = basis.div_(basis.norm(p=2, dim=0).clamp_min(1e-12))
         # compute the epps-pulley statistic
-        x_t = (samples @ basis).unsqueeze(-1) * self.t.to(device=samples.device)
-        # Euler's transformation of real part and imaginary part
-        err = (x_t.cos().mean(dim=0) - self.phi.to(device=samples.device)).square() + x_t.sin().mean(dim=0).square()
-        statistic = (err @ self.weights.to(device=samples.device)) * samples.size(0)
+        with torch.autocast(device_type=samples.device.type, enabled=False):
+            x_t = (samples @ basis).unsqueeze(-1) * self.t.to(device=samples.device)
+            # Euler's transformation of real part and imaginary part
+            err = (x_t.cos().mean(dim=0) - self.phi.to(device=samples.device)).square() + x_t.sin().mean(dim=0).square()
+            statistic = (err @ self.weights.to(device=samples.device)) * samples.size(0)
         return statistic.mean()  # average over projections and time

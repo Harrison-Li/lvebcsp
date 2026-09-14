@@ -3,7 +3,7 @@
 Crystal representation learning with representative building blocks and their
 unit-cell multiplicities. Generation is a separate downstream stage.
 
-`Lvebm` shares one `CrystalEncoder` between representatives and complete crystals.
+`Lvebm` shares one `UniversalEncoder` between representatives and complete crystals.
 Context and target branches both propagate gradients into the shared encoder
 by default (`stop_gradient: false`), matching LeWM. Training uses raw latent
 MSE plus SIGReg on trainable context embeddings. Candidate energy is the same
@@ -15,7 +15,7 @@ are logged to help detect collapse.
 `preprocessing_utils.py` copies `build_crystal_graph` from
 [Meta's all-atom-diffusion-transformer](https://github.com/facebookresearch/all-atom-diffusion-transformer/tree/b9ce505f170597a7c8ca50d13ce8e15df21cf8c9/src/data/components).
 It retains the upstream graph-array fields and CrystalNN/none branches, adds
-radius neighbors for `CrystalEncoder`, and removes the canonical-cell assertion
+radius neighbors for `UniversalEncoder`, and removes the canonical-cell assertion
 so source cells and rotated evaluation cells remain valid.
 `crystal_dataset.py` reuses the tensor-construction block from upstream
 `CrystalDataset.__getitem__`, with `z`, `edge_index`, and `edge_shifts` for our
@@ -93,13 +93,66 @@ OMP_NUM_THREADS=1 PYTHONPATH=src python -m lvebcsp.train.train_jepa \
   --config configs/crystal_jepa.yaml
 ```
 
-The config points to those manifests, uses one GPU when available, and disables
-external logging. The graph trainer supports one device; ordinary PyTorch
-DataParallel does not correctly split this nested PyG batch. `best.ckpt` and
-`last.ckpt` include the model, optimizer, config, and validation metrics.
-`max_train_batches`, `max_eval_batches`, `max_train_samples`, and
-`max_valid_samples` can limit verification runs. A four-update GPU smoke run is
-saved under `outputs/crystal_jepa/smoke/`; it is not a trained production model.
+For one server with four GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 bash scripts/train_crystal_jepa.sh \
+  --manifest-dir /path/to/splits \
+  --output-dir /path/to/crystal_jepa_run
+```
+
+The launcher uses `configs/crystal_jepa_ddp.yaml` and PyTorch DistributedDataParallel
+with one process per GPU. Omit `NPROC_PER_NODE` to use all visible GPUs, or set it
+to 8 for eight GPUs. `--config` selects another YAML. Activate an environment with
+CUDA-enabled PyTorch and this project's dependencies (`pip install -e .`) first.
+On another server, copy the prepared manifests and ensure the LMDB paths in their
+`sources.json` point to accessible files; `--manifest-dir` selects the manifests.
+All launcher paths are resolved from the repository root.
+
+`batch_size: 80` and `eval_batch_size: 80` are **per GPU**; four GPUs give a global
+training batch of 320. Adjust them with `--batch-size` and `--eval-batch-size` if
+needed for larger crystals. `num_workers: 2` is per process for each loader;
+workers use spawn and remain alive across epochs. `precision: auto` selects BF16
+on supported GPUs and FP32 otherwise; use `--precision fp32` to disable autocast.
+AdamW starts at `1e-4`. PyTorch's
+[ReduceLROnPlateau](https://docs.pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.ReduceLROnPlateau.html)
+adapts the learning rate to the validation MSE + SIGReg loss: it halves the rate
+after four consecutive epochs without at least a `1e-4` relative improvement,
+with a minimum rate of `1e-6`. Every rank steps the scheduler after the validation
+loss is reduced across ranks. When no validation split is provided, the training
+loss is used. The scheduler's state and current rate are restored on resume.
+
+Training shards are reshuffled each epoch, with incomplete batches dropped so
+all ranks take the same number of steps. Training SIGReg uses differentiable
+gathering of the global batch and common random projections, in FP32.
+Validation visits each crystal once without duplicated padding, then reduces
+sample-weighted losses across ranks. Validation SIGReg and embedding diagnostics
+are computed within each local batch, so keep validation batch size and GPU count
+fixed when comparing these diagnostics.
+
+Only rank 0 logs and writes `training_config.yaml`, `best.ckpt`, and `last.ckpt`.
+Checkpoints contain model, optimizer, scheduler, epoch, step count, early-stopping
+state, and validation metrics. Resume into the same output directory:
+
+```bash
+NPROC_PER_NODE=4 bash scripts/train_crystal_jepa.sh \
+  --config /path/to/crystal_jepa_run/training_config.yaml \
+  --resume /path/to/crystal_jepa_run/last.ckpt
+```
+
+Resume continues at the next epoch; it does not replay worker augmentation RNG
+states exactly. Keep the same GPU count, batch size, and scheduler configuration
+to retain the intended optimization schedule. For a short installation check:
+
+```bash
+NPROC_PER_NODE=4 bash scripts/train_crystal_jepa.sh \
+  --max-epochs 1 --max-train-batches 2 --max-eval-batches 2 \
+  --max-train-samples 640 --max-valid-samples 160 \
+  --output-dir outputs/crystal_jepa/ddp_check
+```
+
+The multi-GPU config disables external logging and end-of-training packing
+evaluation. The original single-device command remains available.
 
 ## Packing evaluation
 

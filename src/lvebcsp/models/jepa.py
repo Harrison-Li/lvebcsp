@@ -9,7 +9,7 @@ from torch_geometric.data import Batch, Data
 from torch_geometric.nn import global_mean_pool
 
 from lvebcsp.models.condition_encoder import ConditionEncoder
-from lvebcsp.models.encoder import CrystalEncoder, EncoderConfig
+from lvebcsp.models.encoder import UniversalEncoder, EncoderConfig
 from lvebcsp.models.sigreg import SIGReg
 
 
@@ -20,7 +20,7 @@ class Lvebm(nn.Module):
     independently with intrablock edges and no target lattice. ``block_batch``
     [M] assigns blocks to B crystals; ``multiplicity`` [M] gives their absolute
     copy counts in the target cell. ``target`` batches B complete crystal graphs
-    in the same crystal order. All graphs follow CrystalEncoder's input schema.
+    in the same crystal order. All graphs follow UniversalEncoder's input schema.
     """
 
     def __init__(
@@ -40,7 +40,7 @@ class Lvebm(nn.Module):
         cfg = crystal_encoder
         if not isinstance(cfg, EncoderConfig):
             cfg = EncoderConfig(**{"output_dim": d_jepa, **(cfg or {})})
-        self.context_encoder = CrystalEncoder(cfg)
+        self.context_encoder = UniversalEncoder(cfg)
         self.condition_hidden_dim = (condition_encoder or {}).get("hidden_dim", 256)
         self.condition_encoder = ConditionEncoder(d_jepa, self.condition_hidden_dim)
         self.projector = projector or nn.Identity()

@@ -21,13 +21,13 @@ def setup_distributed(backend: str | None = None) -> tuple[int, int, int]:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ["WORLD_SIZE"])
         selected_backend = backend or ("nccl" if torch.cuda.is_available() else "gloo")
+        if selected_backend == "nccl":
+            torch.cuda.set_device(local_rank)
         dist.init_process_group(
             backend=selected_backend,
             rank=rank,
             world_size=world_size,
         )
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
         return rank, local_rank, world_size
 
     # Single-GPU fallback

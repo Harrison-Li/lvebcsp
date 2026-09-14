@@ -21,7 +21,7 @@ CrystalNN = local_env.CrystalNN(distance_cutoffs=None, x_diff_weight=-1, porous_
 
 
 def build_crystal_graph(crystal, graph_method="crystalnn", cutoff=6.0):
-    """Upstream crystal graph extraction, with radius edges for CrystalEncoder."""
+    """Upstream crystal graph extraction, with radius edges for UniversalEncoder."""
 
     if graph_method == "crystalnn":
         try:

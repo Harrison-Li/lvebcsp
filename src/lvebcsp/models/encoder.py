@@ -139,37 +139,32 @@ class LocalAtomTransformerBlock(nn.Module):
 
 
 class Attention(nn.Module):
-    """Noncausal Scaled Dot-Product Attention. True in valid indicates a real key."""
+    """Noncausal multi-head attention. True in valid indicates a real key."""
 
     def __init__(self, dim: int, heads: int, dropout: float) -> None:
         super().__init__()
-        self.heads, self.head_dim, self.dropout = heads, dim // heads, dropout
-        self.query = nn.Linear(dim, dim)
-        self.key_value = nn.Linear(dim, 2 * dim)
-        self.output = nn.Linear(dim, dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
 
     def forward(self, query: Tensor, memory: Tensor, valid: Tensor | None = None) -> Tensor:
-        b, qn, d = query.shape
-
-        def split(x: Tensor) -> Tensor:
-            return x.reshape(b, -1, self.heads, self.head_dim).transpose(1, 2)
-
-        q = split(self.query(query))
-        k, v = (split(x) for x in self.key_value(memory).chunk(2, -1))
-        mask = None if valid is None else valid[:, None, None, :]
-        result = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=mask,
-            is_causal=False,
-            dropout_p=self.dropout if self.training else 0.0,
+        result, _ = self.attention(
+            query=query,
+            key=memory,
+            value=memory,
+            key_padding_mask=None if valid is None else ~valid,
+            need_weights=False,
         )
-        return self.output(result.transpose(1, 2).reshape(b, qn, d))
+        return result
 
 
 class CrossBlock(nn.Module):
-    """Cross-attention block from queries to memory."""
+    """Cross-attention block from queries to memory. Compress per atom token features into a token list
+    reduce the attn computation cost.
+    """
 
     def __init__(self, cfg: EncoderConfig) -> None:
         super().__init__()
@@ -202,20 +197,19 @@ class LatentBlock(nn.Module):
         return tokens + self.ffn(self.norm2(tokens))
 
 
-class CrystalEncoder(nn.Module):
+class UniversalEncoder(nn.Module):
     """Local atom attention followed by latent-token attention and global pooling.
 
     Input is a PyG Data or Batch with z [N] (atomic numbers), pos [N, 3],
     and precomputed edge_index [2, E] (source image -> receiver). Optional
     fields: cell [1, 3, 3] per graph, edge_shifts [E, 3] (integer source-image
-    translations), periodic [1], geometry_known [N], and
+    translations), geometry_known [N], and
     atom_features [N, F]. Batch.from_data_list or a PyG DataLoader handles
     graph collation. Missing cells/shifts mean isolated, unshifted geometry;
     missing geometry_known means all atoms are observed.
 
     Inputs and config are assumed valid; neighbor graphs must cover config.cutoff.
-    forward returns [B, output_dim]; forward_features also returns latent
-    tokens, padded atom tokens, and their validity mask.
+    forward returns a global embedding [B, output_dim].
     """
 
     def __init__(self, config: EncoderConfig | None = None) -> None:
@@ -243,7 +237,6 @@ class CrystalEncoder(nn.Module):
 
         # 32 learned latent queries cross-attending to all atoms
         self.latent_queries = nn.Parameter(torch.randn(1, cfg.num_latents, d) * 0.02)
-        self.metadata_embedding = MLP(10, d, d)
         self.tokenizer = CrossBlock(cfg)
 
         # Latent Transformer blocks
@@ -256,47 +249,12 @@ class CrystalEncoder(nn.Module):
         self.readout = CrossBlock(cfg)
         self.output = nn.Linear(d, cfg.output_dim)
 
-    def _metadata(
-        self, cells: Tensor, periodic: Tensor, observed: Tensor, sizes: Tensor,
-    ) -> Tensor:
-        identity = torch.eye(3, dtype=cells.dtype, device=cells.device)
-        cell = torch.where(periodic[:, None, None], cells, identity)
-        gram = cell @ cell.transpose(-1, -2)
-        lengths = gram.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).sqrt()
-        cosines = torch.stack(
-            [
-                gram[:, 0, 1] / (lengths[:, 0] * lengths[:, 1]),
-                gram[:, 0, 2] / (lengths[:, 0] * lengths[:, 2]),
-                gram[:, 1, 2] / (lengths[:, 1] * lengths[:, 2]),
-            ],
-            dim=-1,
-        )
-        cell_features = torch.cat(
-            [
-                lengths.log(),
-                cosines.clamp(-1, 1),
-                cell.det().abs().clamp_min(1e-12).log()[:, None],
-            ],
-            dim=-1,
-        ) * periodic[:, None]
-        return torch.cat(
-            [
-                cell_features,
-                periodic[:, None].to(cell_features.dtype),
-                observed,
-                sizes.to(cell_features.dtype).log1p()[:, None],
-            ],
-            dim=-1,
-        )
-
-    def forward_features(self, batch: Data | Batch) -> dict[str, Tensor]:
+    def forward(self, batch: Data | Batch) -> Tensor:
         if not isinstance(batch, Batch):
             batch = Batch.from_data_list([batch])
 
         z, pos = batch.z, batch.pos
-        sizes = batch.ptr[1:] - batch.ptr[:-1]
         cells = batch.get("cell", pos.new_zeros(batch.num_graphs, 3, 3)).reshape(-1, 3, 3)
-        periodic = batch.get("periodic", cells.abs().sum(dim=(-1, -2)) > 1e-6).view(-1)
         known = batch.get("geometry_known", torch.ones_like(z, dtype=torch.bool))
 
         atoms = self.atom_embedding(z) + self.geometry_embedding(known.long())
@@ -305,7 +263,9 @@ class CrystalEncoder(nn.Module):
 
         src, dst = batch.edge_index
         shifts = batch.get("edge_shifts", pos.new_zeros(src.numel(), 3))
-        translation = torch.einsum("ei,eij->ej", shifts.to(pos.dtype), cells[batch.batch[dst]])
+        # Preserve periodic geometry precision when neural layers use BF16 autocast.
+        with torch.autocast(device_type=pos.device.type, enabled=False):
+            translation = torch.einsum("ei,eij->ej", shifts.to(pos.dtype), cells[batch.batch[dst]])
         distance = (pos[src] + translation - pos[dst]).norm(dim=-1)
         radial = torch.exp(
             -0.5 * ((distance[:, None] - self.radial_centers) / self.radial_width).square()
@@ -318,10 +278,7 @@ class CrystalEncoder(nn.Module):
         memory, valid = to_dense_batch(
             self.atom_to_memory(atoms), batch.batch, batch_size=batch.num_graphs,
         )
-        observed = pos.new_zeros(batch.num_graphs).index_add(0, batch.batch, known.to(pos.dtype))
-        metadata = self._metadata(cells, periodic, (observed / sizes)[:, None], sizes)
         queries = self.latent_queries.expand(batch.num_graphs, -1, -1)
-        queries = queries + self.metadata_embedding(metadata)[:, None, :]
         tokens = self.tokenizer(queries, memory, valid)
 
         # 3. Latent Transformer blocks
@@ -332,30 +289,7 @@ class CrystalEncoder(nn.Module):
         pooled = self.readout(self.readout_query.expand(batch.num_graphs, -1, -1), tokens)
         embedding = self.output(pooled[:, 0])
 
-        return {
-            "embedding": embedding,
-            "latent_tokens": tokens,
-            "atom_tokens": memory,
-            "valid_mask": valid,
-        }
-
-    def forward(self, batch: Data | Batch) -> Tensor:
-        return self.forward_features(batch)["embedding"]
-
-
-class CrystalPatchEncoder(CrystalEncoder):
-    """Crystal Patch Encoder returning 32 latent patch tokens [B, 32, D]."""
-
-    def __init__(self, dim: int = 256, **kwargs: Any) -> None:
-        if isinstance(dim, EncoderConfig):
-            cfg = dim
-        else:
-            cfg = EncoderConfig(dim=dim, **kwargs)
-        super().__init__(cfg)
-
-    def forward(self, batch: Data | Batch) -> Tensor:
-        """Forward pass returning patch tokens [B, 32, D]."""
-        return self.forward_features(batch)["latent_tokens"]
+        return embedding
 
 
 class PeakEncoder(nn.Module):

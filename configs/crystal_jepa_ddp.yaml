@@ -1,16 +1,19 @@
 seed: 42
-device: auto
-num_gpus: 1
-graph_manifest_dir: /nanolab/libo/lvebpxrd/lvebcsp/outputs/crystal_jepa/splits
-output_dir: /nanolab/libo/lvebpxrd/lvebcsp/outputs/crystal_jepa/train
+device: cuda
+precision: auto  # BF16 on supported GPUs, otherwise FP32; SIGReg stays FP32.
+graph_manifest_dir: outputs/crystal_jepa/splits
+output_dir: outputs/crystal_jepa/train_ddp
+
+# Per GPU: 4 GPUs × 80 crystals = 320 crystals per optimizer step.
 batch_size: 80
 eval_batch_size: 80
-num_workers: 4
+num_workers: 2  # Per process, for each loader.
 random_block_geometry: true
 max_epochs: 100
 learning_rate: 0.0001  # Initial rate; adjusted from validation loss below.
 weight_decay: 0.01
 gradient_clip_norm: 1.0
+
 stop_gradient: false
 d_jepa: 512
 crystal_encoder:
@@ -29,7 +32,7 @@ predictor:
   type: mlp
   hidden_dim: 512
 loss:
-  lambda_sig: 0.1
+  lambda_sig: 0.01
   sigreg_num_projections: 1024
 scheduler:
   type: reduce_on_plateau
@@ -41,6 +44,6 @@ scheduler:
   min_lr: 0.000001
 early_stopping:
   patience: 15
-packing_eval_samples: 32
+packing_eval_samples: 0  # Run the packing evaluator separately after training.
 wandb:
   enabled: false

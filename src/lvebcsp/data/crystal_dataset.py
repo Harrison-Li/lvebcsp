@@ -2,7 +2,7 @@
 
 Tensor construction in graph_to_data is copied from CrystalDataset.__getitem__
 in all-atom-diffusion-transformer, commit b9ce505f170597a7c8ca50d13ce8e15df21cf8c9.
-Changes: z/edge fields for CrystalEncoder; unused diffusion fields omitted.
+Changes: z/edge fields for UniversalEncoder; unused diffusion fields omitted.
 LMDB loading and representative building-block batches are project adapters.
 Upstream credits CDVAE. See third_party/all-atom-diffusion-transformer.
 """

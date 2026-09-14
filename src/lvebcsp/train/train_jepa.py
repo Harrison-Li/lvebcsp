@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.data import Data
 from tqdm.auto import tqdm
 
@@ -24,7 +28,8 @@ from lvebcsp.models.layers import AdaLNMLP, GatedMLP, MLP
 from lvebcsp.models.module import Predictor
 from lvebcsp.common.chemistry import atom_types_to_element_ratios, element_counts_to_ratios
 from lvebcsp.common.config import load_config, save_config, select_device
-from lvebcsp.common.gpu import maybe_data_parallel, primary_device, resolve_gpu_ids, unwrap_model
+from lvebcsp.common.gpu import primary_device, resolve_gpu_ids, unwrap_model
+from lvebcsp.common.distributed import cleanup_distributed, is_distributed, is_main_process, setup_distributed
 from lvebcsp.common.seed import seed_everything
 from lvebcsp.common.wandb_logging import (
     finish_wandb,
@@ -44,6 +49,9 @@ JEPA_LOG_METRICS = (
 JEPA_WANDB_SPLIT_METRICS = (
     ("pred", "loss_pred"),
     ("sigreg", "loss_sigreg"),
+)
+JEPA_METRIC_NAMES = (
+    "loss_pred", "loss_sigreg", "sim_diag", "sim_offdiag", "context_std", "target_std",
 )
 
 
@@ -326,7 +334,7 @@ def ensure_ratio_in_batch(batch: dict[str, Any]) -> dict[str, Any]:
 def batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     """Move tensors and PyG crystal graphs to device."""
 
-    return {key: value.to(device) if isinstance(value, (torch.Tensor, Data)) else value for key, value in batch.items()}
+    return {key: value.to(device, non_blocking=True) if isinstance(value, (torch.Tensor, Data)) else value for key, value in batch.items()}
 
 
 def build_jepa_from_config(config: dict[str, Any]) -> Lvebm:
@@ -457,8 +465,8 @@ def build_lr_scheduler(
     config: dict[str, Any],
     max_epochs: int,
     steps_per_epoch: int,
-) -> tuple[torch.optim.lr_scheduler.LambdaLR | None, str]:
-    """Build an optional learning-rate scheduler from config."""
+) -> tuple[torch.optim.lr_scheduler.LRScheduler | None, str]:
+    """Build a scheduler; the metric interval steps after validation."""
 
     scheduler_cfg = config.get("scheduler")
     if scheduler_cfg in (None, False):
@@ -473,6 +481,10 @@ def build_lr_scheduler(
     scheduler_type = str(cfg.get("type", "")).lower().replace("-", "_")
     if scheduler_type in {"none", "off", "false"}:
         return None, "epoch"
+    if scheduler_type in {"reducelronplateau", "reduce_lr_on_plateau", "reduce_on_plateau"}:
+        cfg.pop("type", None)
+        cfg.pop("interval", None)
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, **cfg), "metric"
     if scheduler_type not in {"linearwarmupcosineannealinglr", "linear_warmup_cosine_annealing_lr"}:
         raise ValueError(f"Unknown scheduler type {cfg.get('type')!r}")
 
@@ -546,12 +558,7 @@ def normalize_jepa_output(out: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_jepa_batch(model: nn.Module, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
-    """Run a JEPA training/eval batch through either a plain module or DataParallel."""
-
-    if isinstance(model, nn.DataParallel):
-        return normalize_jepa_output(model(batch))
-    if isinstance(model, Lvebm):
-        return normalize_jepa_output(model.train_jepa(batch))
+    """Use forward so DDP can synchronize the model's gradients."""
     return normalize_jepa_output(model(batch))
 
 
@@ -576,6 +583,30 @@ def train_jepa_steps(
     return losses
 
 
+def reduce_epoch_statistics(
+    total_loss: float,
+    metric_totals: dict[str, float],
+    samples: int,
+    device: torch.device,
+) -> tuple[float, dict[str, float]]:
+    """Reuse the DLM trainer's reduction, weighted by crystal count."""
+    names = sorted(metric_totals)
+    values = torch.tensor(
+        [total_loss, float(samples), *(metric_totals[name] for name in names)],
+        device=device,
+        dtype=torch.float64,
+    )
+    if is_distributed():
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    denominator = values[1].clamp_min(1.0)
+    loss = float((values[0] / denominator).cpu())
+    metrics = {
+        name: float((values[index + 2] / denominator).cpu())
+        for index, name in enumerate(names)
+    }
+    return loss, metrics
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -585,29 +616,32 @@ def train_one_epoch(
     epoch: int,
     max_epochs: int,
     grad_clip_norm: float = 0.0,
-    scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     scheduler_interval: str = "epoch",
     max_batches: int | None = None,
+    amp_dtype: torch.dtype | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Run one standard PyTorch training epoch."""
 
     model.train()
     running = 0.0
-    metric_sums: dict[str, float] = {}
-    batches = 0
+    metric_sums = dict.fromkeys(JEPA_METRIC_NAMES, 0.0)
+    samples = 0
     progress = tqdm(
         loader,
         desc=f"JEPA epoch {epoch + 1}/{max_epochs}",
         unit="batch",
         dynamic_ncols=True,
         leave=False,
+        disable=not is_main_process(),
     )
     for step, batch in enumerate(progress):
         if max_batches is not None and step >= max_batches:
             break
         batch = batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        out = run_jepa_batch(model, batch)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            out = run_jepa_batch(model, batch)
         loss = out["loss"]
         loss.backward()
         if grad_clip_norm > 0:
@@ -617,13 +651,14 @@ def train_one_epoch(
             scheduler.step()
 
         batch_loss = float(loss.detach().cpu())
-        running += batch_loss
+        batch_size = out["pred_emb"].size(0)
+        running += batch_loss * batch_size
         for name, value in out["metrics"].items():
-            metric_sums[name] = metric_sums.get(name, 0.0) + float(value)
-        batches += 1
-        running_metrics = {name: total / batches for name, total in metric_sums.items()}
+            metric_sums[name] += float(value) * batch_size
+        samples += batch_size
+        running_metrics = {name: total / samples for name, total in metric_sums.items()}
         progress.set_postfix(
-            train_loss=f"{running / batches:.4f}",
+            train_loss=f"{running / samples:.4f}",
             lr=format_learning_rate(float(optimizer.param_groups[0]["lr"])),
             **{
                 name: f"{value:.4f}"
@@ -634,97 +669,165 @@ def train_one_epoch(
     if scheduler is not None and scheduler_interval == "epoch":
         scheduler.step()
 
-    epoch_loss = running / max(batches, 1)
-    epoch_metrics = {name: total / max(batches, 1) for name, total in metric_sums.items()}
-    return epoch_loss, epoch_metrics
+    return reduce_epoch_statistics(running, metric_sums, samples, device)
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader | None, device: torch.device, max_batches: int | None = None) -> tuple[float | None, dict[str, float]]:
+def evaluate(
+    model: nn.Module, loader: DataLoader | None, device: torch.device,
+    max_batches: int | None = None, amp_dtype: torch.dtype | None = None,
+) -> tuple[float | None, dict[str, float]]:
     """Evaluate JEPA loss on a validation loader."""
 
     if loader is None:
         return None, {}
     model.eval()
+    # Validation shards can have different lengths. Avoid DDP forward collectives.
+    model = unwrap_model(model)
     running = 0.0
-    metric_sums: dict[str, float] = {}
-    batches = 0
+    metric_sums = dict.fromkeys(JEPA_METRIC_NAMES, 0.0)
+    samples = 0
     # Use repeatable SIGReg projections for comparable validation losses.
-    sigreg = unwrap_model(model).sigreg
+    sigreg = model.sigreg
     previous_seed = sigreg.seed
     sigreg.seed = 0
-    for step, batch in enumerate(loader):
-        if max_batches is not None and step >= max_batches:
-            break
-        batch = batch_to_device(batch, device)
-        out = run_jepa_batch(model, batch)
-        running += float(out["loss"].detach().cpu())
-        for name, value in out["metrics"].items():
-            metric_sums[name] = metric_sums.get(name, 0.0) + float(value)
-        batches += 1
-    sigreg.seed = previous_seed
-    loss = running / max(batches, 1)
-    metrics = {name: total / max(batches, 1) for name, total in metric_sums.items()}
-    return loss, metrics
+    try:
+        for step, batch in enumerate(loader):
+            if max_batches is not None and step >= max_batches:
+                break
+            batch = batch_to_device(batch, device)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                out = run_jepa_batch(model, batch)
+            batch_size = out["pred_emb"].size(0)
+            running += float(out["loss"].detach().cpu()) * batch_size
+            for name, value in out["metrics"].items():
+                metric_sums[name] += float(value) * batch_size
+            samples += batch_size
+    finally:
+        sigreg.seed = previous_seed
+    return reduce_epoch_statistics(running, metric_sums, samples, device)
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train crystal JEPA from graph manifests")
     parser.add_argument("--config", required=True)
+    parser.add_argument("--manifest-dir", dest="graph_manifest_dir")
+    parser.add_argument("--output-dir")
+    parser.add_argument("--resume", help="Resume model, optimizer, scheduler, and epoch from a checkpoint")
+    parser.add_argument("--precision", choices=("auto", "fp32", "bf16"))
+    for option in (
+        "batch-size", "eval-batch-size", "num-workers", "max-epochs",
+        "max-train-batches", "max-eval-batches", "max-train-samples", "max-valid-samples",
+    ):
+        parser.add_argument(f"--{option}", type=int)
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    seed_everything(int(config.get("seed", 42)))
+    config.update({key: value for key, value in vars(args).items() if key != "config" and value is not None})
+    if "graph_manifest_dir" in config:
+        config["graph_manifest_dir"] = str(Path(config["graph_manifest_dir"]).resolve())
+    output_dir = Path(config.get("output_dir", "outputs/jepa")).resolve()
+    config["output_dir"] = str(output_dir)
     device = select_device(str(config.get("device", "auto")))
-    gpu_ids = resolve_gpu_ids(config, device)
-    device = primary_device(device, gpu_ids)
-    if len(gpu_ids) > 1:
-        raise ValueError("This graph trainer uses one device; ordinary DataParallel cannot split nested PyG batches.")
-
-    dataset = build_dataset_from_config(config, split="train")
-    loader = DataLoader(
-        dataset,
-        batch_size=int(config.get("batch_size", 128)),
-        shuffle=True,
-        drop_last=True,
-        num_workers=int(config.get("num_workers", 4)),
-        collate_fn=collate_crystal_graphs,
-    )
-    val_loader = None
-    if has_dataset_split(config, "valid"):
-        val_dataset = build_dataset_from_config(config, split="valid")
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=int(config.get("eval_batch_size", config.get("batch_size", 128))),
-            shuffle=False,
-            num_workers=int(config.get("num_workers", 4)),
-            collate_fn=collate_crystal_graphs,
-        )
-    model = build_jepa_from_config(config).to(device)
-    model = maybe_data_parallel(model, gpu_ids)
-    max_epochs = int(config.get("max_epochs", 100))
-    optimizer_steps_per_epoch = min(len(loader), config.get("max_train_batches", len(loader)))
-    opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(config.get("learning_rate", 1e-4)),
-        weight_decay=float(config.get("weight_decay", 1e-2)),
-    )
-    scheduler, scheduler_interval = build_lr_scheduler(
-        opt,
-        config,
-        max_epochs=max_epochs,
-        steps_per_epoch=optimizer_steps_per_epoch,
-    )
-    grad_clip_norm = float(config.get("gradient_clip_norm", 0.0))
-    output_dir = Path(config.get("output_dir", "outputs/jepa"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    save_config(config, output_dir / "training_config.yaml")
-    early_stopper = build_early_stopper(config)
-    wandb_run = init_wandb(config, job_type="jepa", output_dir=output_dir, default_name=output_dir.name)
-    maybe_watch_model(wandb_run, unwrap_model(model), config)
-
-    best = float("inf")
+    rank, local_rank, world_size = setup_distributed("nccl" if device.type == "cuda" else "gloo")
+    wandb_run = None
     try:
-        for epoch in range(max_epochs):
+        if dist.is_initialized() and device.type == "cuda":
+            device = torch.device("cuda", local_rank)
+        elif not dist.is_initialized():
+            gpu_ids = resolve_gpu_ids(config, device)
+            if len(gpu_ids) > 1:
+                raise ValueError("Launch one process per GPU with scripts/train_crystal_jepa.sh.")
+            device = primary_device(device, gpu_ids)
+            if device.type == "cuda":
+                torch.cuda.set_device(device)
+
+        precision = config.get("precision", "fp32")
+        if precision == "auto":
+            precision = "bf16" if device.type == "cuda" and torch.cuda.is_bf16_supported() else "fp32"
+        amp_dtype = {"fp32": None, "bf16": torch.bfloat16}[precision]
+        config["precision"] = precision
+        seed = int(config.get("seed", 42))
+        seed_everything(seed)
+        dataset = build_dataset_from_config(config, split="train")
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=seed, drop_last=True,
+        ) if is_distributed() else None
+        workers = int(config.get("num_workers", 4))
+        loader_options = dict(
+            num_workers=workers,
+            collate_fn=collate_crystal_graphs,
+            pin_memory=device.type == "cuda",
+        )
+        if workers > 0:
+            # NCCL and forked workers are incompatible; retain spawned workers across epochs.
+            loader_options.update(multiprocessing_context="spawn", persistent_workers=True)
+        batch_size = int(config.get("batch_size", 16))
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=sampler is None,
+            sampler=sampler, drop_last=True, **loader_options,
+        )
+        if not len(loader):
+            raise ValueError("Training needs at least batch_size × world_size crystals for a full distributed batch.")
+        val_loader = None
+        if has_dataset_split(config, "valid"):
+            val_dataset = build_dataset_from_config(config, split="valid")
+            # Strided validation shards cover every crystal exactly once, without padding.
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=int(config.get("eval_batch_size", batch_size)),
+                sampler=range(rank, len(val_dataset), world_size),
+                **loader_options,
+            )
+
+        model = build_jepa_from_config(config).to(device)
+        if dist.is_initialized():
+            model = DistributedDataParallel(
+                model,
+                device_ids=[local_rank] if device.type == "cuda" else None,
+                broadcast_buffers=False,
+            )
+        max_epochs = int(config.get("max_epochs", 100))
+        optimizer_steps_per_epoch = min(len(loader), config.get("max_train_batches") or len(loader))
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(config.get("learning_rate", 1e-4)),
+            weight_decay=float(config.get("weight_decay", 1e-2)),
+        )
+        scheduler, scheduler_interval = build_lr_scheduler(
+            opt, config, max_epochs=max_epochs, steps_per_epoch=optimizer_steps_per_epoch,
+        )
+        grad_clip_norm = float(config.get("gradient_clip_norm", 0.0))
+        early_stopper = build_early_stopper(config)
+        best, start_epoch, global_step = float("inf"), 0, 0
+        if config.get("resume"):
+            checkpoint = torch.load(config["resume"], map_location="cpu", weights_only=False)
+            unwrap_model(model).load_state_dict(checkpoint["model"])
+            opt.load_state_dict(checkpoint["optimizer"])
+            if scheduler is not None and checkpoint.get("scheduler") is not None:
+                scheduler.load_state_dict(checkpoint["scheduler"])
+            start_epoch = checkpoint["epoch"] + 1
+            global_step = checkpoint.get("global_step", start_epoch * optimizer_steps_per_epoch)
+            best = checkpoint.get("best", checkpoint["monitor_loss"])
+            if early_stopper is not None and checkpoint.get("early_stopping"):
+                for key in ("best", "best_epoch", "wait", "stopped"):
+                    setattr(early_stopper, key, checkpoint["early_stopping"][key])
+            del checkpoint
+
+        if is_main_process():
+            output_dir.mkdir(parents=True, exist_ok=True)
+            save_config(config, output_dir / "training_config.yaml")
+            wandb_run = init_wandb(config, job_type="jepa", output_dir=output_dir, default_name=output_dir.name)
+            maybe_watch_model(wandb_run, unwrap_model(model), config)
+            print(
+                f"device={device} world_size={world_size} precision={precision} "
+                f"batch_per_rank={batch_size} global_batch={batch_size * world_size} "
+                f"train_samples={len(dataset)} valid_samples={len(val_loader.dataset) if val_loader is not None else 0} "
+                f"start_epoch={start_epoch} global_step={global_step}", flush=True,
+            )
+        for epoch in range(start_epoch, max_epochs):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            seed_everything(seed + epoch * world_size + rank)
             epoch_loss, epoch_metrics = train_one_epoch(
                 model,
                 loader,
@@ -736,59 +839,74 @@ def main(argv: list[str] | None = None) -> None:
                 scheduler=scheduler,
                 scheduler_interval=scheduler_interval,
                 max_batches=config.get("max_train_batches"),
+                amp_dtype=amp_dtype,
             )
-            val_loss, val_metrics = evaluate(model, val_loader, device, config.get("max_eval_batches"))
+            global_step += optimizer_steps_per_epoch
+            val_loss, val_metrics = evaluate(
+                model, val_loader, device, config.get("max_eval_batches"), amp_dtype=amp_dtype,
+            )
             monitor_loss = val_loss if val_loss is not None else epoch_loss
+            if scheduler is not None and scheduler_interval == "metric":
+                # All ranks receive the same sample-weighted validation loss.
+                scheduler.step(monitor_loss)
             is_best = monitor_loss < best
             if is_best:
                 best = monitor_loss
             stop_now = early_stopper.step(monitor_loss, epoch) if early_stopper is not None else False
-            ckpt = {
-                "model": unwrap_model(model).state_dict(),
-                "config": config,
-                "epoch": epoch,
-                "loss": epoch_loss,
-                "train_loss": epoch_loss,
-                "metrics": epoch_metrics,
-                "val_loss": val_loss,
-                "val_metrics": val_metrics,
-                "monitor_loss": monitor_loss,
-                "scheduler": scheduler.state_dict() if scheduler is not None else None,
-                "optimizer": opt.state_dict(),
-                "objective": "mse_sigreg_context",
-            }
-            if early_stopper is not None:
-                ckpt["early_stopping"] = early_stopper.state_dict()
-            torch.save(ckpt, output_dir / "last.ckpt")
-            if is_best:
-                torch.save(ckpt, output_dir / "best.ckpt")
-            learning_rate = float(opt.param_groups[0]["lr"])
-            print(format_jepa_epoch_log(epoch, epoch_loss, epoch_metrics, val_loss, val_metrics, learning_rate))
-            epoch_step = (epoch + 1) * optimizer_steps_per_epoch
-            log_wandb(
-                wandb_run,
-                jepa_wandb_metrics(epoch_loss, epoch_metrics, val_loss, val_metrics, learning_rate),
-                step=epoch_step,
-            )
-            if stop_now:
-                print(
-                    "early_stopping "
-                    f"epoch={epoch} monitor_loss={monitor_loss:.6f} "
-                    f"best={early_stopper.best:.6f} best_epoch={early_stopper.best_epoch} "
-                    f"wait={early_stopper.wait}/{early_stopper.patience}"
+            if is_main_process():
+                ckpt = {
+                    "model": unwrap_model(model).state_dict(),
+                    "config": config,
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "world_size": world_size,
+                    "best": best,
+                    "loss": epoch_loss,
+                    "train_loss": epoch_loss,
+                    "metrics": epoch_metrics,
+                    "val_loss": val_loss,
+                    "val_metrics": val_metrics,
+                    "monitor_loss": monitor_loss,
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                    "optimizer": opt.state_dict(),
+                    "objective": "mse_sigreg_context",
+                }
+                if early_stopper is not None:
+                    ckpt["early_stopping"] = early_stopper.state_dict()
+                for name in (("last", "best") if is_best else ("last",)):
+                    temporary = output_dir / f"{name}.ckpt.tmp"
+                    torch.save(ckpt, temporary)
+                    temporary.replace(output_dir / f"{name}.ckpt")
+                learning_rate = float(opt.param_groups[0]["lr"])
+                print(format_jepa_epoch_log(epoch, epoch_loss, epoch_metrics, val_loss, val_metrics, learning_rate), flush=True)
+                log_wandb(
+                    wandb_run,
+                    jepa_wandb_metrics(epoch_loss, epoch_metrics, val_loss, val_metrics, learning_rate),
+                    step=global_step,
                 )
+                if stop_now:
+                    print(
+                        f"early_stopping epoch={epoch} monitor_loss={monitor_loss:.6f} "
+                        f"best={early_stopper.best:.6f} best_epoch={early_stopper.best_epoch} "
+                        f"wait={early_stopper.wait}/{early_stopper.patience}", flush=True,
+                    )
+            if is_distributed():
+                dist.barrier()
+            if stop_now:
                 break
-        if config.get("packing_eval_samples", 0) and val_loader is not None:
+        if is_main_process() and config.get("packing_eval_samples", 0) and val_loader is not None:
             from lvebcsp.eval.crystal_jepa import evaluate_packing
-            import json
             best_ckpt = torch.load(output_dir / "best.ckpt", map_location=device, weights_only=False)
             unwrap_model(model).load_state_dict(best_ckpt["model"])
             report = evaluate_packing(unwrap_model(model), val_dataset, device,
                                       max_samples=config["packing_eval_samples"])
             (output_dir / "packing_valid.json").write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(report, indent=2))
+        if is_distributed():
+            dist.barrier()
     finally:
         finish_wandb(wandb_run)
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

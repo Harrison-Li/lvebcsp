@@ -232,7 +232,8 @@ notebook/
 /diagnostics
 
 # Crystal JEPA regression tests
-/tests
+!/tests/
 !/tests/test_encoder.py
 !/tests/test_jepa.py
 !/tests/test_crystal_graphs.py
+!/tests/test_distributed_jepa.py
