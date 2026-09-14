@@ -230,3 +230,9 @@ notebook/
 /experiments/*
 !/experiments/evaluate_decomposed_bb_roundtrip.py
 /diagnostics
+
+# Crystal JEPA regression tests
+/tests
+!/tests/test_encoder.py
+!/tests/test_jepa.py
+!/tests/test_crystal_graphs.py

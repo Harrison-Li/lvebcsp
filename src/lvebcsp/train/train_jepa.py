@@ -18,6 +18,7 @@ from lvebcsp.data.cif_dataset import CIFPXRDDataset
 from lvebcsp.data.collate import collate_crystal_batch
 from lvebcsp.data.mp20_lmdb import MP20LMDBDataset
 from lvebcsp.data.organic_lmdb import OrganicLMDBDataset
+from lvebcsp.data.crystal_dataset import CrystalDataset, collate_crystal_graphs
 from lvebcsp.models.jepa import Lvebm
 from lvebcsp.models.layers import AdaLNMLP, GatedMLP, MLP
 from lvebcsp.models.module import Predictor
@@ -37,6 +38,8 @@ JEPA_LOG_METRICS = (
     ("pred", "loss_pred"),
     ("sigreg", "loss_sigreg"),
     ("cos", "sim_diag"),
+    ("ctx_std", "context_std"),
+    ("tgt_std", "target_std"),
 )
 JEPA_WANDB_SPLIT_METRICS = (
     ("pred", "loss_pred"),
@@ -352,7 +355,6 @@ def build_jepa_from_config(config: dict[str, Any]) -> Lvebm:
         stop_gradient=bool(config.get("stop_gradient", config.get("stop_gradient_target", False))),
         sigreg_num_projections=int(loss_cfg.get("sigreg_num_projections", 1024)),
         lambda_sig=float(loss_cfg.get("lambda_sig", 0.1)),
-        const=float(loss_cfg.get("const", 0.1)),
     )
 
 
@@ -389,6 +391,13 @@ def build_dataset_from_config(config: dict[str, Any], split: str = "train"):
     """Build a manifest-backed CIF dataset or a supported LMDB dataset."""
 
     split = "valid" if split == "val" else split
+    if "graph_manifest_dir" in config:
+        return CrystalDataset(
+            Path(config["graph_manifest_dir"]) / f"{split}.npz",
+            cutoff=config.get("crystal_encoder", {}).get("cutoff", 6.0),
+            random_block_geometry=split == "train" and config.get("random_block_geometry", True),
+            max_samples=config.get(f"max_{split}_samples"),
+        )
     mp20_path = config.get("mp20_lmdb_path") if split == "train" else config.get(f"mp20_{split}_lmdb_path")
     organic_path = config.get("organic_lmdb_path") if split == "train" else config.get(f"organic_{split}_lmdb_path")
     manifest_path = config.get("manifest_path") if split == "train" else config.get(f"{split}_manifest_path")
@@ -429,6 +438,8 @@ def has_dataset_split(config: dict[str, Any], split: str) -> bool:
     """Return whether the config names a dataset path for a split."""
 
     split = "valid" if split == "val" else split
+    if "graph_manifest_dir" in config:
+        return (Path(config["graph_manifest_dir"]) / f"{split}.npz").exists()
     if split == "train":
         return any(
             key in config
@@ -537,7 +548,6 @@ def normalize_jepa_output(out: dict[str, Any]) -> dict[str, Any]:
 def run_jepa_batch(model: nn.Module, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
     """Run a JEPA training/eval batch through either a plain module or DataParallel."""
 
-    batch = ensure_ratio_in_batch(batch)
     if isinstance(model, nn.DataParallel):
         return normalize_jepa_output(model(batch))
     if isinstance(model, Lvebm):
@@ -577,6 +587,7 @@ def train_one_epoch(
     grad_clip_norm: float = 0.0,
     scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
     scheduler_interval: str = "epoch",
+    max_batches: int | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Run one standard PyTorch training epoch."""
 
@@ -591,7 +602,9 @@ def train_one_epoch(
         dynamic_ncols=True,
         leave=False,
     )
-    for batch in progress:
+    for step, batch in enumerate(progress):
+        if max_batches is not None and step >= max_batches:
+            break
         batch = batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
         out = run_jepa_batch(model, batch)
@@ -627,7 +640,7 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader | None, device: torch.device) -> tuple[float | None, dict[str, float]]:
+def evaluate(model: nn.Module, loader: DataLoader | None, device: torch.device, max_batches: int | None = None) -> tuple[float | None, dict[str, float]]:
     """Evaluate JEPA loss on a validation loader."""
 
     if loader is None:
@@ -636,36 +649,45 @@ def evaluate(model: nn.Module, loader: DataLoader | None, device: torch.device) 
     running = 0.0
     metric_sums: dict[str, float] = {}
     batches = 0
-    for batch in loader:
+    # Use repeatable SIGReg projections for comparable validation losses.
+    sigreg = unwrap_model(model).sigreg
+    previous_seed = sigreg.seed
+    sigreg.seed = 0
+    for step, batch in enumerate(loader):
+        if max_batches is not None and step >= max_batches:
+            break
         batch = batch_to_device(batch, device)
         out = run_jepa_batch(model, batch)
         running += float(out["loss"].detach().cpu())
         for name, value in out["metrics"].items():
             metric_sums[name] = metric_sums.get(name, 0.0) + float(value)
         batches += 1
+    sigreg.seed = previous_seed
     loss = running / max(batches, 1)
     metrics = {name: total / max(batches, 1) for name, total in metric_sums.items()}
     return loss, metrics
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Train PXRD JEPA")
+    parser = argparse.ArgumentParser(description="Train crystal JEPA from graph manifests")
     parser.add_argument("--config", required=True)
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    config["p_max"] = resolve_p_max(config)
     seed_everything(int(config.get("seed", 42)))
     device = select_device(str(config.get("device", "auto")))
     gpu_ids = resolve_gpu_ids(config, device)
     device = primary_device(device, gpu_ids)
+    if len(gpu_ids) > 1:
+        raise ValueError("This graph trainer uses one device; ordinary DataParallel cannot split nested PyG batches.")
 
     dataset = build_dataset_from_config(config, split="train")
     loader = DataLoader(
         dataset,
         batch_size=int(config.get("batch_size", 128)),
         shuffle=True,
+        drop_last=True,
         num_workers=int(config.get("num_workers", 4)),
-        collate_fn=collate_crystal_batch,
+        collate_fn=collate_crystal_graphs,
     )
     val_loader = None
     if has_dataset_split(config, "valid"):
@@ -675,14 +697,12 @@ def main(argv: list[str] | None = None) -> None:
             batch_size=int(config.get("eval_batch_size", config.get("batch_size", 128))),
             shuffle=False,
             num_workers=int(config.get("num_workers", 4)),
-            collate_fn=collate_crystal_batch,
+            collate_fn=collate_crystal_graphs,
         )
     model = build_jepa_from_config(config).to(device)
     model = maybe_data_parallel(model, gpu_ids)
-    if len(gpu_ids) > 1:
-        print(f"using DataParallel on CUDA devices {gpu_ids}")
     max_epochs = int(config.get("max_epochs", 100))
-    optimizer_steps_per_epoch = max(len(loader), 1)
+    optimizer_steps_per_epoch = min(len(loader), config.get("max_train_batches", len(loader)))
     opt = torch.optim.AdamW(
         model.parameters(),
         lr=float(config.get("learning_rate", 1e-4)),
@@ -715,8 +735,9 @@ def main(argv: list[str] | None = None) -> None:
                 grad_clip_norm=grad_clip_norm,
                 scheduler=scheduler,
                 scheduler_interval=scheduler_interval,
+                max_batches=config.get("max_train_batches"),
             )
-            val_loss, val_metrics = evaluate(model, val_loader, device)
+            val_loss, val_metrics = evaluate(model, val_loader, device, config.get("max_eval_batches"))
             monitor_loss = val_loss if val_loss is not None else epoch_loss
             is_best = monitor_loss < best
             if is_best:
@@ -733,6 +754,8 @@ def main(argv: list[str] | None = None) -> None:
                 "val_metrics": val_metrics,
                 "monitor_loss": monitor_loss,
                 "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "optimizer": opt.state_dict(),
+                "objective": "mse_sigreg_context",
             }
             if early_stopper is not None:
                 ckpt["early_stopping"] = early_stopper.state_dict()
@@ -755,6 +778,15 @@ def main(argv: list[str] | None = None) -> None:
                     f"wait={early_stopper.wait}/{early_stopper.patience}"
                 )
                 break
+        if config.get("packing_eval_samples", 0) and val_loader is not None:
+            from lvebcsp.eval.crystal_jepa import evaluate_packing
+            import json
+            best_ckpt = torch.load(output_dir / "best.ckpt", map_location=device, weights_only=False)
+            unwrap_model(model).load_state_dict(best_ckpt["model"])
+            report = evaluate_packing(unwrap_model(model), val_dataset, device,
+                                      max_samples=config["packing_eval_samples"])
+            (output_dir / "packing_valid.json").write_text(json.dumps(report, indent=2) + "\n")
+            print(json.dumps(report, indent=2))
     finally:
         finish_wandb(wandb_run)
 

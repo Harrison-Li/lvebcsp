@@ -11,6 +11,14 @@ requires-python = ">=3.8"
 dependencies = [
     "torch",
     "torch-geometric",
+    "ase",
+    "lmdb",
+    "numpy",
+    "networkx",
+    "pymatgen",
+    "PyYAML",
+    "tqdm",
+    "einops",
 ]
 
 [tool.setuptools.packages.find]

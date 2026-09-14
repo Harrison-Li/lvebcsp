@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch, Data
 from torch_geometric.nn import global_mean_pool
 
-from lvebcsp.losses.alignment import latent_energy
 from lvebcsp.models.condition_encoder import ConditionEncoder
 from lvebcsp.models.encoder import CrystalEncoder, EncoderConfig
 from lvebcsp.models.sigreg import SIGReg
@@ -33,7 +32,6 @@ class Lvebm(nn.Module):
         stop_gradient: bool = False,
         lambda_sig: float = 0.1,
         sigreg_num_projections: int = 1024,
-        const: float = 0.1,
         crystal_encoder: EncoderConfig | dict[str, Any] | None = None,
         condition_encoder: dict[str, Any] | None = None,
     ) -> None:
@@ -50,7 +48,6 @@ class Lvebm(nn.Module):
         self.pred_proj = pred_proj or nn.Identity()
         self.sigreg = SIGReg(num_proj=sigreg_num_projections)
         self.lambda_sig = lambda_sig
-        self.const = const
         self.stop_gradient = stop_gradient
 
     def encode(self, graph: Data | Batch) -> Tensor:
@@ -72,8 +69,9 @@ class Lvebm(nn.Module):
         return self.pred_proj(preds)
 
     def encode_tgt(self, graph: Data | Batch) -> Tensor:
-        """Encode complete crystals using the shared crystal branch."""
-        return self.encode(graph)
+        """Share encoder weights and enable target gradients by default, as in LeWM."""
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not self.stop_gradient):
+            return self.encode(graph)
 
     def encode_ctx(
         self,
@@ -89,7 +87,7 @@ class Lvebm(nn.Module):
 
     def compute_energy(self, query_latent: Tensor, candidate: Data | Batch) -> Tensor:
         """Return one latent energy per candidate crystal."""
-        return latent_energy(query_latent, self.encode_tgt(candidate))
+        return (query_latent - self.encode_tgt(candidate)).square().mean(dim=-1)
 
     def train_jepa(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Compute JEPA losses and convert metrics for logging."""
@@ -104,24 +102,25 @@ class Lvebm(nn.Module):
         *,
         ctx_emb: Tensor,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        """Align predictions and regularize both encoder views with SIGReg.
-
-        stop_gradient detaches targets for alignment; SIGReg still trains both views.
-        """
+        """MSE alignment with SIGReg on trainable context embeddings."""
         target = tgt_emb.detach() if self.stop_gradient else tgt_emb
-        sim_scores = F.normalize(pred_emb, dim=-1) @ F.normalize(target, dim=-1).T
-        labels = torch.arange(pred_emb.shape[0], device=pred_emb.device)
-        loss_pred = F.cross_entropy(sim_scores / self.const, labels)
-        loss_sig = 0.5 * (self.sigreg(ctx_emb) + self.sigreg(tgt_emb))
+        loss_pred = F.mse_loss(pred_emb, target)
+        loss_sig = self.sigreg(ctx_emb)
         loss = loss_pred + self.lambda_sig * loss_sig
 
-        offdiag_mask = ~torch.eye(pred_emb.shape[0], dtype=torch.bool, device=pred_emb.device)
-        offdiag_similarity = (sim_scores * offdiag_mask).sum() / offdiag_mask.sum().clamp_min(1)
+        pred_norm = F.normalize(pred_emb.detach(), dim=-1)
+        target_norm = F.normalize(target.detach(), dim=-1)
+        paired_similarity = (pred_norm * target_norm).sum(dim=-1)
+        total_similarity = (pred_norm.sum(dim=0) * target_norm.sum(dim=0)).sum()
+        batch_size = pred_emb.shape[0]
+        offdiag_similarity = (total_similarity - paired_similarity.sum()) / max(batch_size * (batch_size - 1), 1)
         return loss, {
             "loss_pred": loss_pred,
             "loss_sigreg": loss_sig,
-            "sim_diag": sim_scores.diag().mean(),
+            "sim_diag": paired_similarity.mean(),
             "sim_offdiag": offdiag_similarity,
+            "context_std": ctx_emb.detach().std(dim=0, unbiased=False).mean(),
+            "target_std": target.detach().std(dim=0, unbiased=False).mean(),
         }
 
     def forward(self, batch: dict[str, Any]) -> dict[str, Any]:

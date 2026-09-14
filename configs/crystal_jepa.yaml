@@ -1,0 +1,42 @@
+seed: 42
+device: auto
+num_gpus: 1
+graph_manifest_dir: /nanolab/libo/lvebpxrd/lvebcsp/outputs/crystal_jepa/splits
+output_dir: /nanolab/libo/lvebpxrd/lvebcsp/outputs/crystal_jepa/train
+batch_size: 16
+eval_batch_size: 16
+num_workers: 4
+random_block_geometry: true
+max_epochs: 100
+learning_rate: 0.0001
+weight_decay: 0.01
+gradient_clip_norm: 1.0
+stop_gradient: false
+d_jepa: 512
+crystal_encoder:
+  atom_dim: 64
+  dim: 256
+  output_dim: 512
+  num_latents: 32
+  local_layers: 3
+  latent_layers: 4
+  heads: 8
+  radial_basis: 32
+  cutoff: 6.0
+condition_encoder:
+  hidden_dim: 256
+predictor:
+  type: mlp
+  hidden_dim: 512
+loss:
+  lambda_sig: 0.1
+  sigreg_num_projections: 1024
+scheduler:
+  type: linear_warmup_cosine_annealing_lr
+  interval: step
+  warmup_fraction: 0.05
+early_stopping:
+  patience: 15
+packing_eval_samples: 32
+wandb:
+  enabled: false
