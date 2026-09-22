@@ -1,10 +1,7 @@
-"""Adapted from https://github.com/lucas-maes/le-wm/blob/main/module.py"""
-
-from __future__ import annotations
+"""Copied from https://github.com/lucas-maes/le-wm/blob/main/module.py"""
 
 import torch
-import torch.distributed as dist
-from torch.distributed.nn.functional import all_gather
+import math
 from torch import nn
 
 
@@ -15,11 +12,9 @@ class SIGReg(nn.Module):
     T^{m} = \int \omega(t) |\phi(t;h_m)-\phi_0|^2 dt
     h_m = Z \cdot u_m
     """
-
-    def __init__(self, knots: int = 17, num_proj: int = 1024, seed: int | None = None):
+    def __init__(self, knots=17, num_proj=1024):
         super().__init__()
         self.num_proj = num_proj
-        self.seed = seed
         t = torch.linspace(0, 3, knots, dtype=torch.float32)
         dt = 3 / (knots - 1)
         weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
@@ -31,29 +26,181 @@ class SIGReg(nn.Module):
 
     def forward(self, proj):
         """
-        proj: [..., D]
+        proj: (groups, samples, features), or (samples, features).
+        Crystal slots and slot differences use (T, B, D), with crystals as samples.
         """
-        if proj.ndim < 2:
-            raise ValueError(f"SIGReg expects at least 2 dimensions [..., D], got {tuple(proj.shape)}")
-        samples = proj.reshape(-1, proj.size(-1)).to(torch.float32)
-        distributed = self.training and dist.is_initialized() and dist.get_world_size() > 1
-        if distributed:
-            # Training loaders supply equal batches; keep cross-rank gradients.
-            samples = torch.cat(all_gather(samples), dim=0)
-        generator = None
-        if self.seed is not None:
-            generator = torch.Generator(device=samples.device)
-            generator.manual_seed(int(self.seed))
-        # Build Gaussian basis from hypersphere directions.
-        basis = torch.randn(samples.size(-1), self.num_proj, device=samples.device, generator=generator)
-        if distributed:
-            # Every rank evaluates the same global-batch statistic.
-            dist.broadcast(basis, src=0)
-        basis = basis.div_(basis.norm(p=2, dim=0).clamp_min(1e-12))
+        # sample random projections
+        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
+        A = A.div_(A.norm(p=2, dim=0))
         # compute the epps-pulley statistic
-        with torch.autocast(device_type=samples.device.type, enabled=False):
-            x_t = (samples @ basis).unsqueeze(-1) * self.t.to(device=samples.device)
-            # Euler's transformation of real part and imaginary part
-            err = (x_t.cos().mean(dim=0) - self.phi.to(device=samples.device)).square() + x_t.sin().mean(dim=0).square()
-            statistic = (err @ self.weights.to(device=samples.device)) * samples.size(0)
-        return statistic.mean()  # average over projections and time
+        x_t = (proj @ A).unsqueeze(-1) * self.t
+        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
+        statistic = (err @ self.weights) * proj.size(-2)
+        return statistic.mean() # average over projections and time
+
+
+class VISReg(nn.Module):
+    """
+    VISReg regularizer.
+
+    Drop-in usage:
+        reg = VISReg(num_proj=1024)
+        loss = reg(z)
+
+    Input:
+        z: (..., N, D)
+
+        N = number of samples
+        D = embedding dimension
+
+        Examples:
+            (B, D)
+            (T, B, D)
+
+    The loss contains:
+        1. variance / scale regularization
+        2. sliced-Wasserstein Gaussian shape regularization
+        3. centering regularization
+    """
+
+    def __init__(
+        self,
+        num_proj=1024,
+        scale_weight=1.0,
+        shape_weight=1.0,
+        center_weight=1.0,
+        eps=1e-4,
+    ):
+        super().__init__()
+
+        self.num_proj = num_proj
+        self.scale_weight = scale_weight
+        self.shape_weight = shape_weight
+        self.center_weight = center_weight
+        self.eps = eps
+
+    def forward(self, z):
+        """
+        Args:
+            z: (..., N, D)
+
+        Returns:
+            scalar VISReg loss
+        """
+
+        if z.ndim < 2:
+            raise ValueError(
+                f"VISReg expects (..., N, D), got {tuple(z.shape)}"
+            )
+
+        N = z.size(-2)
+        D = z.size(-1)
+
+        if N < 2:
+            raise ValueError(
+                "VISReg requires at least 2 samples."
+            )
+
+        # ---------------------------------------------------------
+        # Center
+        # ---------------------------------------------------------
+        mu = z.mean(dim=-2, keepdim=True)
+        zc = z - mu
+
+        # ---------------------------------------------------------
+        # Per-feature scale
+        #
+        # Use population std because we are matching N(0, I).
+        # ---------------------------------------------------------
+        std = torch.sqrt(
+            zc.square().mean(dim=-2, keepdim=True) + self.eps
+        )
+
+        # Explicit anti-collapse / variance term
+        scale_loss = (std - 1.0).square().mean()
+
+        # ---------------------------------------------------------
+        # Shape normalization
+        #
+        # Important: stop gradient through std.
+        # The shape loss therefore does not try to control scale.
+        # ---------------------------------------------------------
+        zn = zc / std.detach().clamp_min(self.eps)
+
+        # ---------------------------------------------------------
+        # Random directions on unit sphere
+        #
+        # A: (D, K)
+        # ---------------------------------------------------------
+        A = torch.randn(
+            D,
+            self.num_proj,
+            device=z.device,
+            dtype=z.dtype,
+        )
+
+        A = A / A.norm(
+            p=2,
+            dim=0,
+            keepdim=True,
+        ).clamp_min(self.eps)
+
+        # ---------------------------------------------------------
+        # Random 1-D projections
+        #
+        # (..., N, D) @ (D, K)
+        #       ->
+        # (..., N, K)
+        # ---------------------------------------------------------
+        projected = zn @ A
+
+        # Empirical quantiles
+        projected = projected.sort(dim=-2).values
+
+        # ---------------------------------------------------------
+        # Standard Gaussian target quantiles
+        #
+        # q_i = Phi^{-1}((i + 0.5) / N)
+        # ---------------------------------------------------------
+        p = (
+            torch.arange(
+                N,
+                device=z.device,
+                dtype=z.dtype,
+            )
+            + 0.5
+        ) / N
+
+        q = math.sqrt(2.0) * torch.erfinv(
+            2.0 * p - 1.0
+        )
+
+        # Make q broadcast against (..., N, K)
+        q_shape = [1] * projected.ndim
+        q_shape[-2] = N
+        q_shape[-1] = 1
+
+        q = q.view(q_shape)
+
+        # ---------------------------------------------------------
+        # Sliced Wasserstein shape loss
+        # ---------------------------------------------------------
+        shape_loss = (
+            projected - q
+        ).square().mean()
+
+        # ---------------------------------------------------------
+        # Center regularization
+        # ---------------------------------------------------------
+        center_loss = mu.square().mean()
+
+        # ---------------------------------------------------------
+        # Total VISReg
+        # ---------------------------------------------------------
+        loss = (
+            self.scale_weight * scale_loss
+            + self.shape_weight * shape_loss
+            + self.center_weight * center_loss
+        )
+
+        return loss

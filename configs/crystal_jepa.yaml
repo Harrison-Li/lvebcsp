@@ -1,35 +1,41 @@
 seed: 42
 device: auto
+precision: fp32
 num_gpus: 1
-graph_manifest_dir: /nanolab/libo/lvebpxrd/lvebcsp/outputs/crystal_jepa/splits
-output_dir: /nanolab/libo/lvebpxrd/lvebcsp/outputs/crystal_jepa/train
+graph_manifest_dir: /nanolab/libo/lvebpxrd/lvebcsp/dataset/crystal_jepa/splits
+output_dir: outputs/crystal_jepa/train_rigid_context
 batch_size: 80
 eval_batch_size: 80
-num_workers: 4
+num_workers: 8
+log_every_steps: 20
 random_block_geometry: true
+context_translation_std: [0.05, 0.75]  # Sample a Gaussian std (angstroms) per crystal.
+context_rotation_degrees: [5.0, 90.0]  # Sample an angle; independent axis per molecular copy.
+prediction_target: crystal_tokens  # Predict untouched Ct's tokens from the complete perturbed Cc.
 max_epochs: 100
 learning_rate: 0.0001  # Initial rate; adjusted from validation loss below.
 weight_decay: 0.01
 gradient_clip_norm: 1.0
-stop_gradient: false
-d_jepa: 512
+d_jepa: 512  # Feature width per token; crystal latents are [B, 32, 512].
 crystal_encoder:
   atom_dim: 64
   dim: 256
-  output_dim: 512
+  output_dim: 512  # Linear projection of each 256-wide token; no global pooling.
   num_latents: 32
   local_layers: 3
   latent_layers: 4
   heads: 8
-  radial_basis: 32
+  radial_basis: 64
   cutoff: 6.0
 condition_encoder:
   hidden_dim: 256
 predictor:
-  type: mlp
+  type: gated_mlp
   hidden_dim: 512
 loss:
+  # SIGReg per latent slot: [32, crystal_batch, 512], on both branches.
   lambda_sig: 0.1
+  mu_diff: 0.0  # Difference SIGReg disabled; only per-slot SIGReg remains.
   sigreg_num_projections: 1024
 scheduler:
   type: reduce_on_plateau

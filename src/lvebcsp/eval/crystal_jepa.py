@@ -16,6 +16,7 @@ import torch
 
 from lvebcsp.data.crystal_dataset import CrystalDataset, graph_to_data, collate_crystal_graphs
 from lvebcsp.data.preprocessing_utils import build_crystal_graph
+from lvebcsp.data.crystal_pxrd import PEAK_FIELDS
 
 
 def atoms_to_graph(atoms, cutoff):
@@ -50,7 +51,9 @@ def evaluate_packing(model, dataset, device, *, max_samples=32, max_families=16,
     for index in chosen:
         item = dataset[int(index)]
         batch = collate_crystal_graphs([item])
-        query = model.encode_ctx(batch["context"].to(device), batch["multiplicity"].to(device), batch["block_batch"].to(device))
+        query = model.encode_ctx(batch["context"].to(device), batch["multiplicity"].to(device), batch["block_batch"].to(device),
+                                 crystal_context=batch["crystal_context"].to(device),
+                                 **{key: batch[key].to(device) for key in PEAK_FIELDS if key in batch})
         graph = item["target"]
         target = model.encode_tgt(graph.to(device))
         rotation, _ = np.linalg.qr(rng.normal(size=(3, 3)))
@@ -107,8 +110,11 @@ def evaluate_packing(model, dataset, device, *, max_samples=32, max_families=16,
             if len(distinct) < 2:
                 continue
             batch = collate_crystal_graphs(distinct)
-            query = model.encode_ctx(batch["context"].to(device), batch["multiplicity"].to(device), batch["block_batch"].to(device))
             target = model.encode_tgt(batch["target"].to(device))
+            target = target.flatten(1)
+            query = model.encode_ctx(batch["context"].to(device), batch["multiplicity"].to(device), batch["block_batch"].to(device),
+                                     crystal_context=batch["crystal_context"].to(device) if "crystal_context" in batch else None,
+                                     **{key: batch[key].to(device) for key in PEAK_FIELDS if key in batch}).flatten(1)
             energies = (query[:, None] - target[None, :]).square().mean(dim=-1)
             own = energies.diag()[:, None]
             # Mid-rank handles ties without depending on row order.
@@ -123,6 +129,9 @@ def evaluate_packing(model, dataset, device, *, max_samples=32, max_families=16,
                                   "candidate_count": len(distinct)})
 
     return {
+        "prediction_target": model.prediction_target,
+        "context_translation_std": dataset.context_translation_std,
+        "context_rotation_degrees": dataset.context_rotation_degrees,
         "samples": len(invariance), "packing_perturbations": len(sensitivity),
         "rigid_transform_mse": float(np.mean(invariance)) if invariance else None,
         "packing_change_mse": float(np.mean(sensitivity)) if sensitivity else None,
@@ -134,14 +143,15 @@ def evaluate_packing(model, dataset, device, *, max_samples=32, max_families=16,
         "within_family_mrr": float(np.mean(reciprocal_ranks)) if reciprocal_ranks else None,
         "within_family_target_mse": float(np.mean(separations)) if separations else None,
         "groups": groups_report,
-        "notes": ["Synthetic perturbations translate building-block instances; they are not verified polymorphs.",
+        "notes": ["Crystal contexts measure recovery from perturbed reference packing with a known lattice; they do not measure molecule-only CSP.",
+                  "Synthetic perturbations translate building-block instances; they are not verified polymorphs.",
                   "Within-family candidates share inferred heavy-atom connectivity hashes and multiplicities and differ under StructureMatcher. Bond orders/hydrogens and experimental polymorph labels are not verified.",
                   "Native-vs-perturbed and exact-refcode retrieval are diagnostics; a shared context can have multiple compatible targets."],
     }
 
 
 def main():
-    from lvebcsp.train.train_jepa import build_jepa_from_config
+    from lvebcsp.train.jepa_setup import build_jepa_from_config, load_jepa_weights, graph_pxrd_config
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--split", choices=["valid", "test"], default="test")
@@ -155,11 +165,16 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = checkpoint["config"]
     model = build_jepa_from_config(config).to(device)
-    model.load_state_dict(checkpoint["model"])
+    load_jepa_weights(model, checkpoint["model"])
     manifest = Path(args.manifest_dir or config["graph_manifest_dir"]) / f"{args.split}.npz"
-    dataset = CrystalDataset(manifest, cutoff=model.context_encoder.config.cutoff)
+    dataset = CrystalDataset(manifest, cutoff=model.context_encoder.config.cutoff,
+                             context_translation_std=config.get("context_translation_std", 0.0),
+                             context_rotation_degrees=config.get("context_rotation_degrees", 0.0),
+                             pxrd_config=graph_pxrd_config(config) if model.peak_encoder is not None else None)
     report = evaluate_packing(model, dataset, device, max_samples=args.max_samples, max_families=args.max_families)
-    report.update(checkpoint=str(Path(args.checkpoint).resolve()), split=str(manifest.resolve()), epoch=checkpoint.get("epoch"))
+    report.update(checkpoint=str(Path(args.checkpoint).resolve()), split=str(manifest.resolve()), epoch=checkpoint.get("epoch"),
+                  latent_shape=[model.context_encoder.config.num_latents, model.d_jepa],
+                  source_had_pooled_readout=any(k.startswith("context_encoder.readout") for k in checkpoint["model"]))
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))

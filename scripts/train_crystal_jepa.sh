@@ -7,7 +7,8 @@ export PYTHONPATH="$repo_root/src${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export PYTHONUNBUFFERED=1
 
-# One process per visible GPU by default; set NPROC_PER_NODE to use fewer.
+# Complete perturbed contexts -> clean targets, one process per visible GPU.
+# Set NPROC_PER_NODE to select the process count; --config overrides the default.
 exec python -m torch.distributed.run \
   --standalone --nnodes=1 --nproc-per-node="${NPROC_PER_NODE:-gpu}" \
   --module lvebcsp.train.train_jepa \

@@ -14,6 +14,7 @@ dependencies = [
     "ase",
     "lmdb",
     "numpy",
+    "scipy",
     "networkx",
     "pymatgen",
     "PyYAML",

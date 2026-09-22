@@ -11,6 +11,8 @@ without the canonical-cell assertion. process_one adapts our LMDB row schema.
 See third_party/all-atom-diffusion-transformer for the source and license.
 """
 
+from collections import Counter
+
 import numpy as np
 from pymatgen.analysis import local_env
 from pymatgen.analysis.graphs import StructureGraph
@@ -76,6 +78,36 @@ def build_crystal_graph(crystal, graph_method="crystalnn", cutoff=6.0):
     }
 
 
+def crystal_building_blocks(row):
+    """Read representatives and restore omitted one-atom source components.
+
+    Some *_2 tables omit monatomic blocks that are present in the full molecule
+    list. Their identity/count come from that list, with a zero-position template;
+    no target coordinates, poses, or lattice are used to build the condition.
+    """
+    blocks = []
+    multiplicity = [row["repeat_dict_2"][group] for group in row["mol_group_id_2"]]
+    for start, end in row["mol2_group_slices"]:
+        geometries = np.asarray(row["mol_atom_pos_2"][:, start:end], dtype=np.float32)
+        atom_types = np.array(Molecule(row["mol_atom_type_2"][start:end], geometries[0]).atomic_numbers)
+        atom_map = np.asarray(row.get("mol_atom_map_2", np.full(len(row["mol_atom_type_2"]), -1)))[start:end]
+        blocks.append({"atom_types": atom_types, "geometries": geometries, "atom_map": atom_map})
+    single_atoms = Counter(row["mol_atom_type"][start]
+                           for start, end in row.get("mol_group_slices", []) if end - start == 1)
+    for symbol, total in single_atoms.items():
+        z = Molecule([symbol], [[0, 0, 0]]).atomic_numbers[0]
+        matching = [i for i, block in enumerate(blocks) if block["atom_types"].tolist() == [z]]
+        missing = total - sum(multiplicity[i] for i in matching)
+        if missing > 0:
+            if matching:
+                multiplicity[matching[0]] += missing
+            else:
+                blocks.append({"atom_types": np.array([z]), "atom_map": np.array([-1]),
+                               "geometries": np.zeros((1, 1, 3), dtype=np.float32)})
+                multiplicity.append(missing)
+    return blocks, np.asarray(multiplicity, dtype=np.int64)
+
+
 def process_one(row, cutoff=6.0):
     """Adapt the current CCDC LMDB schema to crystal and building-block arrays.
 
@@ -86,14 +118,11 @@ def process_one(row, cutoff=6.0):
                         np.asarray(row["crystal_atom_pos"]) % 1.0)
     graph_arrays = build_crystal_graph(crystal, graph_method="radius", cutoff=cutoff)
     graph_arrays["block_instance_id"] = np.asarray(row["crystal_group_id2"])
-    blocks = []
-    for start, end in row["mol2_group_slices"]:
-        geometries = np.asarray(row["mol_atom_pos_2"][:, start:end], dtype=np.float32)
-        atom_types = np.array(Molecule(row["mol_atom_type_2"][start:end], geometries[0]).atomic_numbers)
-        blocks.append({"atom_types": atom_types, "geometries": geometries})
+    graph_arrays["atom_map"] = np.asarray(row.get("crystal_atom_map", np.full(len(crystal), -1)))
+    blocks, multiplicity = crystal_building_blocks(row)
     return {
         "material_id": str(row["cif_filename"]),
         "graph_arrays": graph_arrays,
         "blocks": blocks,
-        "multiplicity": np.array([row["repeat_dict_2"][group] for group in row["mol_group_id_2"]]),
+        "multiplicity": multiplicity,
     }

@@ -1,4 +1,4 @@
-"""Flow-matching corruption utilities for structure tensors."""
+"""Flow-matching corruption utilities for structure tensors and latent tokens."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ class FlowMatchingInterpolant:
     This is intentionally kept close to the AADT/protein-frame-flow style
     implementation: one ``t_min`` parameter, centered Gaussian noise, optional
     ``diffuse_mask``, and Euler helpers for clean-endpoint denoisers.
+    Set ``center_noise=False`` for latent tokens without a zero-mean constraint.
     """
 
     def __init__(
@@ -23,6 +24,7 @@ class FlowMatchingInterpolant:
         self_condition: bool = False,
         self_condition_prob: float = 0.5,
         device: torch.device | str = "cpu",
+        center_noise: bool = True,
     ) -> None:
         self.t_min = t_min
         self.corrupt = corrupt
@@ -30,6 +32,7 @@ class FlowMatchingInterpolant:
         self.self_condition = self_condition
         self.self_condition_prob = self_condition_prob
         self.device = device
+        self.center_noise = center_noise
 
     def _sample_t(self, batch_size: int) -> torch.Tensor:
         t = torch.rand(batch_size, device=self.device)
@@ -37,7 +40,7 @@ class FlowMatchingInterpolant:
 
     def _centered_gaussian(self, batch_size: int, num_tokens: int, emb_dim: int = 3) -> torch.Tensor:
         noise = torch.randn(batch_size, num_tokens, emb_dim, device=self.device)
-        return noise - torch.mean(noise, dim=-2, keepdims=True)
+        return noise - noise.mean(dim=-2, keepdim=True) if self.center_noise else noise
 
     def _corrupt_x(
         self,

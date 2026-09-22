@@ -56,7 +56,7 @@ class GatedMLP(nn.Module):
             nn.Linear(hidden_dim, output_dim),
         )
         self.gate = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim, output_dim),
             nn.Sigmoid()
         )
     

@@ -31,7 +31,7 @@ class FeedForward(nn.Module):
 
 
 class Attention(nn.Module):
-    """Scaled dot-product attention with causal masking"""
+    """Scaled dot-product attention without causal masking"""
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
@@ -49,7 +49,7 @@ class Attention(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x, causal=True):
+    def forward(self, x):#, causal=True):
         """
         x : (B, T, D)
         """
@@ -57,7 +57,7 @@ class Attention(nn.Module):
         drop = self.dropout if self.training else 0.0
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
         q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop,) #is_causal=causal)
         out = rearrange(out, "b h t d -> b t (h d)")
         return self.to_out(out)
 
@@ -325,3 +325,38 @@ class GaussianBasis(torch.nn.Module):
         """
         diff = x.unsqueeze(-1) - self.centers
         return torch.exp(self.coeff * diff.square())
+
+
+class PolynomialCutoff(nn.Module):
+    """
+    PolynomialCutoff function that ensures a smooth decrease near the cutoff
+    Adapted from https://github.com/TUM-DAML/gemnet_pytorch/blob/master/gemnet/model/layers/envelope.py
+
+    Parameters
+    ----------
+        p: int
+            Exponent of the PolynomialCutoff function.
+        r_c: float
+            The cutoff radius in the graph.
+    """
+
+    def __init__(self, p, r_c):
+        super().__init__()
+        assert p > 0
+        self.p = p
+        self.a = -(self.p + 1) * (self.p + 2) / 2
+        self.b = self.p * (self.p + 2)
+        self.c = -self.p * (self.p + 1) / 2
+        self.cutoff = r_c
+
+    
+
+    def forward(self, r):
+        r_scaled = r / self.cutoff
+        env_val = (
+            1
+            + self.a * r_scaled ** self.p
+            + self.b * r_scaled ** (self.p + 1)
+            + self.c * r_scaled ** (self.p + 2)
+        )
+        return torch.where(r_scaled < 1, env_val, torch.zeros_like(r_scaled))

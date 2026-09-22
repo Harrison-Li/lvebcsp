@@ -19,13 +19,6 @@ from lvebcsp.data.mp20_lmdb import MP20LMDBDataset
 from lvebcsp.data.representation import tensor_to_structure
 from lvebcsp.inference.export_cif import export_structure_to_cif
 from lvebcsp.losses.validity import has_usable_lattice
-from lvebcsp.models.canvas import FormulaConditioner
-from lvebcsp.train.dllm_checkpoint import initialize_from_checkpoint
-from lvebcsp.train.train_dllm import (
-    build_dllm_from_config,
-    compute_pxrd_latent,
-    load_jepa_target_encoder,
-)
 from lvebcsp.common.config import load_config, select_device
 from lvebcsp.common.seed import seed_everything
 
@@ -483,6 +476,14 @@ def evaluate_mp20_dllm(
         raise ValueError("top_k must be positive")
     if selected_top_k > num_evals:
         raise ValueError("top_k cannot exceed num_evals")
+    # The matching helpers also serve crystal reconstruction, which does not
+    # depend on the legacy DLM sampling model.
+    from lvebcsp.models.canvas import FormulaConditioner
+    from lvebcsp.train.dllm_checkpoint import initialize_from_checkpoint
+    from lvebcsp.train.train_dllm import (
+        build_dllm_from_config, compute_pxrd_latent, load_jepa_target_encoder,
+    )
+
     seed_everything(seed)
     checkpoint_path = Path(checkpoint_path).resolve()
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
